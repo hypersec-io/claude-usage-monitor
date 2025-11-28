@@ -1,3 +1,10 @@
+# [2.7.0](https://github.com/hypersec-io/claude-usage-monitor/compare/v2.6.6...v2.7.0) (2025-11-28)
+
+
+### Features
+
+* major refactor - headless browser, dynamic ports, unified UI ([094be97](https://github.com/hypersec-io/claude-usage-monitor/commit/094be97f7b846316fba110b3e08d9988f55525f8))
+
 ## [2.6.6](https://github.com/hypersec-io/claude-usage-monitor/compare/v2.6.5...v2.6.6) (2025-11-27)
 
 
