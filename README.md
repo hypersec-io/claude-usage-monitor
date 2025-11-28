@@ -152,6 +152,15 @@ Open VS Code Settings and search for "Claude Usage" to configure:
 - **Range**: `1-60` minutes
 - **Description**: Auto-refresh interval in minutes for checking Claude.ai usage and session token data
 
+### `claudeUsage.tokenLimit`
+- **Type**: Number
+- **Default**: `200000`
+- **Range**: `1000-2000000`
+- **Description**: Context window token limit used to calculate usage percentage
+  - **Standard**: 200,000 tokens (default for all Claude models)
+  - **Extended**: 1,000,000 tokens (available for Claude Sonnet 4 via API with `context-1m-2025-08-07` beta header)
+  - Adjust this if you're using extended context or if Anthropic updates the default limit
+
 **Recommended Configuration** (`settings.json`):
 ```json
 {

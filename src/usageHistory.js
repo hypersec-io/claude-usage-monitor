@@ -1,6 +1,5 @@
 const fs = require('fs').promises;
-const path = require('path');
-const os = require('os');
+const { PATHS } = require('./utils');
 
 /**
  * Manages historical usage data for sparkline visualization
@@ -9,7 +8,7 @@ const os = require('os');
 class UsageHistory {
     constructor(historyFilePath) {
         // Store in OS temp directory alongside session-data.json
-        this.historyFilePath = historyFilePath || path.join(os.tmpdir(), 'claude-usage-history.json');
+        this.historyFilePath = historyFilePath || PATHS.USAGE_HISTORY_FILE;
         this.maxDataPoints = 96; // Keep last 96 data points (8 hours at 5-min intervals)
     }
 

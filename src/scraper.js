@@ -1,8 +1,22 @@
+/** @format */
+
 const puppeteer = require('puppeteer');
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
 const vscode = require('vscode');
+
+const { ClaudeAuth } = require('./auth');
+const {
+    CONFIG_NAMESPACE,
+    TIMEOUTS,
+    VIEWPORT,
+    CLAUDE_URLS,
+    isDebugEnabled,
+    getDebugChannel,
+    setDevMode,
+    sleep
+} = require('./utils');
 const {
     USAGE_API_SCHEMA,
     API_ENDPOINTS,
@@ -12,93 +26,90 @@ const {
     getSchemaInfo,
 } = require('./apiSchema');
 
-// Debug output channel for API responses (lazy creation)
-let debugChannel = null;
-
-function getDebugChannel() {
-    if (!debugChannel) {
-        debugChannel = vscode.window.createOutputChannel('Claude Usage - API Debug');
-    }
-    return debugChannel;
-}
-
-// Track if we're running in development mode (set during activation)
-let runningInDevMode = false;
-
 /**
- * Set whether running in development mode
- * @param {boolean} isDev
+ * Claude.ai Usage Scraper
+ * Handles browser automation for fetching usage data from Claude.ai
  */
-function setDevMode(isDev) {
-    runningInDevMode = isDev;
-}
-
-/**
- * Check if debug mode is enabled via settings OR running in development mode
- * @returns {boolean}
- */
-function isDebugEnabled() {
-    // Check user setting
-    const config = vscode.workspace.getConfiguration('claudeUsage');
-    const userEnabled = config.get('debug', false);
-
-    return userEnabled || runningInDevMode;
-}
-
 class ClaudeUsageScraper {
     constructor() {
         this.browser = null;
         this.page = null;
-        this.sessionDir = path.join(os.homedir(), '.claude-browser-session');
         this.isInitialized = false;
-        this.debugPort = 9222; // Chrome remote debugging port
-        this.isConnectedBrowser = false; // Track if we connected vs launched
-        this.apiEndpoint = null; // Captured API endpoint URL
-        this.apiHeaders = null; // Captured API request headers
+        this.browserPort = null; // Will be set dynamically for browser remote debugging
+        this.isConnectedBrowser = false;
+
+        // API endpoint capture
+        this.apiEndpoint = null;
+        this.apiHeaders = null;
+        this.creditsEndpoint = null;
+        this.overageEndpoint = null;
+        this.capturedEndpoints = [];
+
+        // Auth module
+        this.auth = new ClaudeAuth();
     }
 
     /**
-     * Helper function to wait/sleep (replacement for deprecated page.waitForTimeout)
-     * @param {number} ms - Milliseconds to wait
-     * @returns {Promise<void>}
+     * Find an available port for browser remote debugging
+     * @returns {Promise<number>}
      */
-    async sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
+    async findAvailablePort() {
+        const net = require('net');
+        return new Promise((resolve, reject) => {
+            const server = net.createServer();
+            server.unref();
+            server.on('error', reject);
+            server.listen(0, () => {
+                const port = server.address().port;
+                server.close(() => resolve(port));
+            });
+        });
     }
 
     /**
-     * Find Chrome executable on the system
-     * @returns {string|null} Path to Chrome executable or null
+     * Get session directory (delegate to auth)
+     */
+    get sessionDir() {
+        return this.auth.getSessionDir();
+    }
+
+    /**
+     * Find Chrome/Chromium executable on the system
+     * @returns {string|null} Path to Chrome executable, or null if not found
      */
     findChrome() {
-        const possiblePaths = [];
+        const chromePaths = [];
 
         if (process.platform === 'win32') {
-            possiblePaths.push(
-                // Google Chrome locations
+            chromePaths.push(
                 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
                 'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
                 path.join(os.homedir(), 'AppData', 'Local', 'Google', 'Chrome', 'Application', 'chrome.exe'),
-                // Scoop package manager
                 'C:\\AppInstall\\scoop\\apps\\googlechrome\\current\\chrome.exe',
-                // Microsoft Edge (Chromium-based)
-                'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
-                'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe'
+                // Edge is Chromium-based, works as fallback
+                'C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe',
+                'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
             );
         } else if (process.platform === 'darwin') {
-            possiblePaths.push(
-                '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+            chromePaths.push(
+                '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+                '/Applications/Chromium.app/Contents/MacOS/Chromium',
+                '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge'
             );
         } else {
-            possiblePaths.push(
+            // Linux
+            chromePaths.push(
                 '/usr/bin/google-chrome',
+                '/usr/bin/google-chrome-stable',
                 '/usr/bin/chromium-browser',
-                '/usr/bin/chromium'
+                '/usr/bin/chromium',
+                '/snap/bin/chromium',
+                '/usr/bin/microsoft-edge',
+                '/usr/bin/microsoft-edge-stable'
             );
         }
 
-        // Find first existing path
-        for (const chromePath of possiblePaths) {
+        for (const chromePath of chromePaths) {
             try {
                 if (fs.existsSync(chromePath)) {
                     console.log(`Found Chrome at: ${chromePath}`);
@@ -109,53 +120,47 @@ class ClaudeUsageScraper {
             }
         }
 
-        console.log('Chrome not found in common locations, will use Puppeteer default');
         return null;
     }
 
     /**
      * Try to connect to an existing browser instance
-     * @returns {Promise<boolean>} True if connected successfully
+     * @returns {Promise<boolean>}
      */
     async tryConnectToExisting() {
         try {
-            const browserURL = `http://127.0.0.1:${this.debugPort}`;
+            const browserURL = `http://127.0.0.1:${this.browserPort}`;
             this.browser = await puppeteer.connect({
                 browserURL,
-                defaultViewport: null // Use the browser's viewport
+                defaultViewport: null
             });
 
-            // Get existing pages or create a new one
             const pages = await this.browser.pages();
             if (pages.length > 0) {
-                // Try to find a page that's already on Claude
                 for (const page of pages) {
                     const url = page.url();
-                    if (url.includes('claude.ai')) {
+                    if (url.includes(CLAUDE_URLS.BASE)) {
                         this.page = page;
                         break;
                     }
                 }
-
-                // If no Claude page found, use the first page
                 if (!this.page) {
                     this.page = pages[0];
                 }
             } else {
-                // Create a new page if none exist
                 this.page = await this.browser.newPage();
             }
 
-            // Set a realistic user agent
             await this.page.setUserAgent(
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
             );
 
-            // Set up request interception to capture API calls
             await this.setupRequestInterception();
 
             this.isInitialized = true;
-            this.isConnectedBrowser = true; // Mark as connected (not launched)
+            this.isConnectedBrowser = true;
+            this.auth.setPageAndBrowser(this.page, this.browser);
+
             console.log('Successfully connected to existing browser');
             return true;
         } catch (error) {
@@ -165,114 +170,78 @@ class ClaudeUsageScraper {
     }
 
     /**
-     * Check if session is logged in by looking for session files
-     * @returns {boolean} True if likely logged in
+     * Check if session exists (delegate to auth)
+     * @returns {boolean}
      */
     hasExistingSession() {
-        try {
-            // Check if session directory exists and has cookie files
-            if (!fs.existsSync(this.sessionDir)) {
-                return false;
-            }
-
-            // Look for Chrome's cookie files in the session directory
-            const cookieFiles = [
-                path.join(this.sessionDir, 'Default', 'Cookies'),
-                path.join(this.sessionDir, 'Default', 'Network', 'Cookies')
-            ];
-
-            for (const cookieFile of cookieFiles) {
-                if (fs.existsSync(cookieFile)) {
-                    const stats = fs.statSync(cookieFile);
-                    // If cookie file exists and has content, likely logged in
-                    if (stats.size > 0) {
-                        return true;
-                    }
-                }
-            }
-
-            return false;
-        } catch (error) {
-            console.log('Error checking session:', error);
-            return false;
-        }
+        return this.auth.hasExistingSession();
     }
 
     /**
      * Initialize the Puppeteer browser instance
-     * @param {boolean} forceHeaded - Force browser to show (for login)
+     * @param {boolean} forceHeaded - Force browser to show
      */
     async initialize(forceHeaded = false) {
-        // Check if browser is still connected
+        // If already initialized with a valid browser, skip
         if (this.isInitialized && this.browser) {
             try {
-                // Test if browser is still alive
                 await this.browser.version();
-                return; // Browser is still running, reuse it
+                return;
             } catch (error) {
-                // Browser was closed, reset state
                 this.browser = null;
                 this.page = null;
                 this.isInitialized = false;
             }
         }
 
-        // First, try to connect to an existing browser instance
-        const connected = await this.tryConnectToExisting();
-        if (connected) {
-            return; // Successfully connected to existing browser
-        }
+        // Note: We no longer try to connect to existing browsers since we close
+        // the browser after each fetch to save resources
 
-        // No existing browser found, launch a new one
-        const config = vscode.workspace.getConfiguration('claudeUsage');
+        const config = vscode.workspace.getConfiguration(CONFIG_NAMESPACE);
         const userHeadless = config.get('headless', true);
-
-        // Use headless mode unless forced to show or user disabled headless
         const headless = forceHeaded ? false : userHeadless;
 
         try {
-            // Try to find Chrome executable path
-            const executablePath = this.findChrome();
+            const chromePath = this.findChrome();
+
+            // Chrome is required for web scraping
+            if (!chromePath) {
+                throw new Error('CHROME_NOT_FOUND');
+            }
+
+            // Find an available port dynamically to avoid conflicts
+            this.browserPort = await this.findAvailablePort();
 
             const launchOptions = {
                 headless: headless ? 'new' : false,
                 userDataDir: this.sessionDir,
+                executablePath: chromePath,
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-blink-features=AutomationControlled',
-                    `--remote-debugging-port=${this.debugPort}` // Enable remote debugging
+                    `--remote-debugging-port=${this.browserPort}`
                 ],
-                defaultViewport: {
-                    width: 1280,
-                    height: 800
-                }
+                defaultViewport: { width: VIEWPORT.WIDTH, height: VIEWPORT.HEIGHT }
             };
 
-            // Add executablePath if found
-            if (executablePath) {
-                launchOptions.executablePath = executablePath;
-            }
-
-            console.log(`Launching new browser with remote debugging on port ${this.debugPort}`);
+            console.log(`Launching Chrome on port ${this.browserPort}`);
             this.browser = await puppeteer.launch(launchOptions);
-
             this.page = await this.browser.newPage();
 
-            // Set a realistic user agent to avoid detection
             await this.page.setUserAgent(
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
             );
 
-            // Set up request interception to capture API calls
             await this.setupRequestInterception();
 
             this.isInitialized = true;
-            this.isConnectedBrowser = false; // Mark as launched (not connected)
+            this.isConnectedBrowser = false;
+            this.auth.setPageAndBrowser(this.page, this.browser);
+
             console.log('Successfully launched new browser');
         } catch (error) {
-            // If browser is already running error, provide helpful message
             if (error.message.includes('already running')) {
                 throw new Error('Browser session is locked by another process. Please close all Chrome/Edge windows and try again, or restart VSCode.');
             }
@@ -282,63 +251,68 @@ class ClaudeUsageScraper {
 
     /**
      * Ensure user is logged into Claude.ai
-     * Will wait for manual login if necessary
+     * Uses fast cookie validation, falls back to login flow
      */
     async ensureLoggedIn() {
+        const debug = isDebugEnabled();
+
         try {
-            // Navigate directly to settings/usage page
-            await this.page.goto('https://claude.ai/settings/usage', {
-                waitUntil: 'networkidle2',
-                timeout: 30000
-            });
+            // Fast path: validate session with API call (no page navigation)
+            const validation = await this.auth.validateSession();
 
-            // Wait a moment for any redirects
-            await this.sleep(2000);
+            if (validation.valid) {
+                if (debug) {
+                    getDebugChannel().appendLine('Auth: Session valid (fast path)');
+                }
+                // Navigate to usage page now that we know we're authenticated
+                await this.page.goto(CLAUDE_URLS.USAGE, {
+                    waitUntil: 'networkidle2',
+                    timeout: TIMEOUTS.PAGE_LOAD
+                });
+                return;
+            }
 
-            const currentUrl = this.page.url();
+            if (debug) {
+                getDebugChannel().appendLine(`Auth: Session invalid (${validation.reason}), need login`);
+            }
 
-            // If URL contains 'login' or 'auth', user needs to log in
-            if (currentUrl.includes('login') || currentUrl.includes('auth')) {
-                // Automatically relaunch browser in headed mode so user can see login page
-                vscode.window.showInformationMessage(
-                    'Login required. Opening browser for Claude.ai login...'
+            // Need login - open headed browser with progress notification
+            await this.forceOpenBrowser();
+
+            // Wait for login with dismissable progress notification
+            const loggedIn = await vscode.window.withProgress(
+                {
+                    location: vscode.ProgressLocation.Notification,
+                    title: 'Login required. Please log in to Claude.ai in the browser window...',
+                    cancellable: false
+                },
+                async () => {
+                    return await this.auth.waitForLogin();
+                }
+            );
+
+            if (loggedIn) {
+                // Show success message that auto-dismisses after 3 seconds
+                vscode.window.withProgress(
+                    {
+                        location: vscode.ProgressLocation.Notification,
+                        title: '✓ Login successful! Session saved.',
+                        cancellable: false
+                    },
+                    () => new Promise(resolve => setTimeout(resolve, 3000))
                 );
-                await this.forceOpenBrowser();
 
-                // Wait for login to complete (max 5 minutes)
-                // Magic link flow: user may open link in another tab, so we poll
-                // by refreshing the usage page to check if session is now valid
-                const maxWaitTime = 300000; // 5 minutes
-                const pollInterval = 3000; // Check every 3 seconds
-                const startTime = Date.now();
-                let loggedIn = false;
+                // Close the headed browser and relaunch in headless mode
+                // Session is saved in userDataDir so we stay logged in
+                await this.close();
+                await this.initialize(false); // false = use headless setting
 
-                while (Date.now() - startTime < maxWaitTime) {
-                    await this.sleep(pollInterval);
-
-                    try {
-                        // Try navigating to the usage page to check if logged in
-                        await this.page.goto('https://claude.ai/settings/usage', {
-                            waitUntil: 'networkidle2',
-                            timeout: 10000
-                        });
-
-                        const checkUrl = this.page.url();
-                        if (!checkUrl.includes('login') && !checkUrl.includes('auth')) {
-                            loggedIn = true;
-                            break;
-                        }
-                    } catch (navError) {
-                        // Navigation error, continue polling
-                        console.log('Login check navigation error:', navError.message);
-                    }
-                }
-
-                if (loggedIn) {
-                    vscode.window.showInformationMessage('Login successful! Session saved for future use.');
-                } else {
-                    throw new Error('Login timeout. Please try again and complete the login process.');
-                }
+                await this.page.goto(CLAUDE_URLS.USAGE, {
+                    waitUntil: 'networkidle2',
+                    timeout: TIMEOUTS.PAGE_LOAD
+                });
+            } else {
+                throw new Error('Login timeout. Please try again and complete the login process.');
             }
         } catch (error) {
             if (error.message.includes('timeout')) {
@@ -353,26 +327,19 @@ class ClaudeUsageScraper {
      */
     async setupRequestInterception() {
         try {
-            // Enable request interception
             await this.page.setRequestInterception(true);
-
-            // Store all captured API endpoints for debugging
             this.capturedEndpoints = [];
 
-            // Listen for API requests
             this.page.on('request', (request) => {
                 const url = request.url();
 
-                // Log ALL API calls to debug channel for discovery (only if debug enabled)
                 if (url.includes('/api/')) {
                     if (isDebugEnabled()) {
-                        const debugOutput = getDebugChannel();
-                        debugOutput.appendLine(`[REQUEST] ${request.method()} ${url}`);
+                        getDebugChannel().appendLine(`[REQUEST] ${request.method()} ${url}`);
                     }
                     this.capturedEndpoints.push({ method: request.method(), url });
                 }
 
-                // Capture endpoints using schema definitions (see apiSchema.js)
                 if (matchesEndpoint(url, API_ENDPOINTS.usage)) {
                     this.apiEndpoint = url;
                     this.apiHeaders = {
@@ -392,15 +359,12 @@ class ClaudeUsageScraper {
                     console.log('Captured overage endpoint:', this.overageEndpoint);
                 }
 
-                // Always continue the request
                 request.continue();
             });
 
-            // Also listen for responses to capture response data (only log if debug enabled)
             this.page.on('response', async (response) => {
                 const url = response.url();
 
-                // Log API responses with their data (only if debug enabled)
                 if (isDebugEnabled() && url.includes('/api/') && response.status() === 200) {
                     try {
                         const contentType = response.headers()['content-type'] || '';
@@ -410,14 +374,6 @@ class ClaudeUsageScraper {
                             debugOutput.appendLine(`[RESPONSE] ${url}`);
                             debugOutput.appendLine(JSON.stringify(data, null, 2));
                             debugOutput.appendLine('---');
-
-                            // Highlight important endpoints
-                            if (url.includes('/prepaid/credits')) {
-                                debugOutput.appendLine('*** PREPAID CREDITS DATA ABOVE ***');
-                            }
-                            if (url.includes('/overage_spend_limit')) {
-                                debugOutput.appendLine('*** OVERAGE SPEND LIMIT DATA ABOVE ***');
-                            }
                         }
                     } catch (e) {
                         // Ignore parse errors
@@ -428,28 +384,23 @@ class ClaudeUsageScraper {
             console.log('Request interception enabled for API capture');
         } catch (error) {
             console.warn('Failed to set up request interception:', error.message);
-            // Don't throw - fall back to HTML scraping
         }
     }
 
     /**
      * Calculate human-readable reset time from ISO timestamp
-     * @param {string} isoTimestamp - ISO 8601 timestamp
-     * @returns {string} Human-readable time remaining
+     * @param {string} isoTimestamp
+     * @returns {string}
      */
     calculateResetTime(isoTimestamp) {
-        if (!isoTimestamp) {
-            return 'Unknown';
-        }
+        if (!isoTimestamp) return 'Unknown';
 
         try {
             const resetDate = new Date(isoTimestamp);
             const now = new Date();
             const diffMs = resetDate - now;
 
-            if (diffMs <= 0) {
-                return 'Soon';
-            }
+            if (diffMs <= 0) return 'Soon';
 
             const hours = Math.floor(diffMs / (1000 * 60 * 60));
             const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
@@ -470,48 +421,33 @@ class ClaudeUsageScraper {
     }
 
     /**
-     * Process API response and convert to expected format
-     * Uses schema from apiSchema.js for easy updates when API changes
-     *
-     * @param {object} apiResponse - Raw API response
-     * @param {object} creditsData - Optional prepaid credits data
-     * @param {object} overageData - Optional overage spend limit data
-     * @returns {object} Processed usage data
+     * Process API response using schema
+     * @param {object} apiResponse
+     * @param {object} creditsData
+     * @param {object} overageData
+     * @returns {object}
      */
     processApiResponse(apiResponse, creditsData = null, overageData = null) {
         try {
-            // Extract all fields using schema (see apiSchema.js for field mappings)
             const data = extractFromSchema(apiResponse, USAGE_API_SCHEMA);
-
-            // Process overage data using schema helper
             const monthlyCredits = processOverageData(overageData);
 
             return {
-                // 5-hour session
                 usagePercent: data.fiveHour.utilization,
                 resetTime: this.calculateResetTime(data.fiveHour.resetsAt),
-
-                // 7-day overall
                 usagePercentWeek: data.sevenDay.utilization,
                 resetTimeWeek: this.calculateResetTime(data.sevenDay.resetsAt),
-
-                // 7-day per-model (Nov 2025)
                 usagePercentSonnet: data.sevenDaySonnet.utilization,
                 resetTimeSonnet: this.calculateResetTime(data.sevenDaySonnet.resetsAt),
                 usagePercentOpus: data.sevenDayOpus.utilization,
                 resetTimeOpus: this.calculateResetTime(data.sevenDayOpus.resetsAt),
-
-                // Extra usage / prepaid credits
                 extraUsage: data.extraUsage.value,
                 prepaidCredits: creditsData ?? null,
                 monthlyCredits: monthlyCredits,
-
-                // Metadata
                 timestamp: new Date(),
-                rawData: apiResponse,  // Keep raw data for debugging
-                schemaVersion: getSchemaInfo().version,  // Track which schema version was used
+                rawData: apiResponse,
+                schemaVersion: getSchemaInfo().version,
             };
-
         } catch (error) {
             console.error('Error processing API response:', error);
             throw new Error('Failed to process API response data');
@@ -519,27 +455,24 @@ class ClaudeUsageScraper {
     }
 
     /**
-     * Fetch usage data from Claude.ai settings/usage page
-     * @returns {Promise<{usagePercent: number, resetTime: string, timestamp: Date}>}
+     * Fetch usage data from Claude.ai
+     * @returns {Promise<object>}
      */
     async fetchUsageData() {
+        const debug = isDebugEnabled();
+
         try {
-            // Navigate directly to the usage page to trigger API calls
-            await this.page.goto('https://claude.ai/settings/usage', {
+            await this.page.goto(CLAUDE_URLS.USAGE, {
                 waitUntil: 'networkidle2',
-                timeout: 30000
+                timeout: TIMEOUTS.PAGE_LOAD
             });
 
-            // Wait for page to load and potentially capture API endpoint
-            await this.sleep(2000);
+            await sleep(TIMEOUTS.API_RETRY_DELAY);
 
-            // If we captured the API endpoint, use it directly for faster, more reliable data
-            const debug = isDebugEnabled();
             if (debug) {
                 const debugOutput = getDebugChannel();
                 debugOutput.appendLine(`\n=== FETCH ATTEMPT (${new Date().toLocaleString()}) ===`);
                 debugOutput.appendLine(`API endpoint captured: ${this.apiEndpoint ? 'YES' : 'NO'}`);
-                debugOutput.appendLine(`API headers captured: ${this.apiHeaders ? 'YES' : 'NO'}`);
                 debugOutput.appendLine(`Credits endpoint captured: ${this.creditsEndpoint ? 'YES' : 'NO'}`);
                 debugOutput.appendLine(`Overage endpoint captured: ${this.overageEndpoint ? 'YES' : 'NO'}`);
             }
@@ -549,126 +482,80 @@ class ClaudeUsageScraper {
                     console.log('Using captured API endpoint for direct access');
                     if (debug) getDebugChannel().appendLine('Attempting direct API fetch...');
 
-                    // Get cookies from the page context
                     const cookies = await this.page.cookies();
-                    const cookieString = cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
+                    const cookieString = cookies.map(c => `${c.name}=${c.value}`).join('; ');
 
-                    // Make direct API call within page context to use browser's auth
-                    const response = await this.page.evaluate(async (endpoint, headers, cookieString) => {
-                        const response = await fetch(endpoint, {
+                    const response = await this.page.evaluate(async (endpoint, headers, cookieStr) => {
+                        const resp = await fetch(endpoint, {
                             method: 'GET',
-                            headers: {
-                                ...headers,
-                                'Cookie': cookieString
-                            }
+                            headers: { ...headers, 'Cookie': cookieStr }
                         });
-
-                        if (!response.ok) {
-                            throw new Error(`API request failed: ${response.status}`);
-                        }
-
-                        return await response.json();
+                        if (!resp.ok) throw new Error(`API request failed: ${resp.status}`);
+                        return await resp.json();
                     }, this.apiEndpoint, this.apiHeaders, cookieString);
 
-                    // Log raw API response for debugging (only if debug enabled)
                     if (debug) {
-                        const debugOutput = getDebugChannel();
-                        debugOutput.appendLine('Direct API fetch SUCCESS!');
-                        debugOutput.appendLine(`=== RAW USAGE API RESPONSE ===`);
-                        debugOutput.appendLine(JSON.stringify(response, null, 2));
-                        debugOutput.appendLine('=== END RAW USAGE API RESPONSE ===');
+                        getDebugChannel().appendLine('Direct API fetch SUCCESS!');
+                        getDebugChannel().appendLine(JSON.stringify(response, null, 2));
                     }
 
-                    // Also fetch prepaid credits if endpoint is available
+                    // Fetch credits and overage data
                     let creditsData = null;
+                    let overageData = null;
+
                     if (this.creditsEndpoint) {
                         try {
-                            creditsData = await this.page.evaluate(async (endpoint, headers, cookieString) => {
+                            creditsData = await this.page.evaluate(async (endpoint, headers, cookieStr) => {
                                 const resp = await fetch(endpoint, {
                                     method: 'GET',
-                                    headers: { ...headers, 'Cookie': cookieString }
+                                    headers: { ...headers, 'Cookie': cookieStr }
                                 });
-                                if (resp.ok) {
-                                    return await resp.json();
-                                }
-                                return null;
+                                return resp.ok ? await resp.json() : null;
                             }, this.creditsEndpoint, this.apiHeaders, cookieString);
-
-                            if (creditsData && debug) {
-                                const debugOutput = getDebugChannel();
-                                debugOutput.appendLine('=== PREPAID CREDITS RESPONSE ===');
-                                debugOutput.appendLine(JSON.stringify(creditsData, null, 2));
-                                debugOutput.appendLine('=== END PREPAID CREDITS RESPONSE ===');
-                            }
-                        } catch (creditsError) {
-                            if (debug) getDebugChannel().appendLine(`Credits fetch error: ${creditsError.message}`);
+                        } catch (e) {
+                            if (debug) getDebugChannel().appendLine(`Credits fetch error: ${e.message}`);
                         }
                     }
 
-                    // Fetch overage/spend limit data (contains monthly credit usage)
-                    let overageData = null;
                     if (this.overageEndpoint) {
                         try {
-                            overageData = await this.page.evaluate(async (endpoint, headers, cookieString) => {
+                            overageData = await this.page.evaluate(async (endpoint, headers, cookieStr) => {
                                 const resp = await fetch(endpoint, {
                                     method: 'GET',
-                                    headers: { ...headers, 'Cookie': cookieString }
+                                    headers: { ...headers, 'Cookie': cookieStr }
                                 });
-                                if (resp.ok) {
-                                    return await resp.json();
-                                }
-                                return null;
+                                return resp.ok ? await resp.json() : null;
                             }, this.overageEndpoint, this.apiHeaders, cookieString);
-
-                            if (overageData && debug) {
-                                const debugOutput = getDebugChannel();
-                                debugOutput.appendLine('=== OVERAGE SPEND LIMIT RESPONSE ===');
-                                debugOutput.appendLine(JSON.stringify(overageData, null, 2));
-                                debugOutput.appendLine('=== END OVERAGE SPEND LIMIT RESPONSE ===');
-                            }
-                        } catch (overageError) {
-                            if (debug) getDebugChannel().appendLine(`Overage fetch error: ${overageError.message}`);
+                        } catch (e) {
+                            if (debug) getDebugChannel().appendLine(`Overage fetch error: ${e.message}`);
                         }
                     }
 
-                    if (debug) getDebugChannel().appendLine('');
-
-                    // Process API response and return
                     console.log('Successfully fetched data via API');
                     return this.processApiResponse(response, creditsData, overageData);
 
                 } catch (apiError) {
                     console.log('API call failed, falling back to HTML scraping:', apiError.message);
                     if (debug) getDebugChannel().appendLine(`Direct API fetch FAILED: ${apiError.message}`);
-                    // Fall through to HTML scraping fallback
                 }
-            } else {
-                if (debug) getDebugChannel().appendLine('Skipping direct API - endpoint or headers not captured yet');
             }
 
-            // Fallback: Extract text content and parse usage data from HTML
+            // Fallback: HTML scraping
             console.log('Using HTML scraping method');
-            if (debug) getDebugChannel().appendLine('Falling back to HTML scraping method...');
+            if (debug) getDebugChannel().appendLine('Falling back to HTML scraping...');
+
             const data = await this.page.evaluate(() => {
                 const bodyText = document.body.innerText;
-
-                // Extract usage percentage
                 const usageMatch = bodyText.match(/(\d+)%\s*used/i);
-                const usagePercent = usageMatch ? parseInt(usageMatch[1], 10) : null;
-
-                // Extract reset time
                 const resetMatch = bodyText.match(/Resets?\s+in\s+([^\n]+)/i);
-                const resetTime = resetMatch ? resetMatch[1].trim() : null;
-
                 return {
-                    usagePercent,
-                    resetTime,
-                    bodyText: bodyText.substring(0, 500) // For debugging
+                    usagePercent: usageMatch ? parseInt(usageMatch[1], 10) : null,
+                    resetTime: resetMatch ? resetMatch[1].trim() : null
                 };
             });
 
             if (data.usagePercent === null) {
-                throw new Error('Could not find usage percentage on settings page. The page layout may have changed.');
+                throw new Error('Could not find usage percentage. Page layout may have changed.');
             }
 
             return {
@@ -686,17 +573,14 @@ class ClaudeUsageScraper {
     }
 
     /**
-     * Close/disconnect from the browser instance
-     * Only closes the browser if we launched it; disconnects if we connected to existing
+     * Close/disconnect from the browser
      */
     async close() {
         if (this.browser) {
             if (this.isConnectedBrowser) {
-                // We connected to an existing browser, just disconnect
                 await this.browser.disconnect();
                 console.log('Disconnected from shared browser');
             } else {
-                // We launched this browser, close it completely
                 await this.browser.close();
                 console.log('Closed browser instance');
             }
@@ -708,20 +592,17 @@ class ClaudeUsageScraper {
     }
 
     /**
-     * Reset the scraper - close connection and clear all captured endpoints
-     * Useful for debugging or recovering from a bad state
+     * Reset connection and clear captured endpoints
+     * @returns {Promise<object>}
      */
     async reset() {
         const debug = isDebugEnabled();
         if (debug) {
-            const debugOutput = getDebugChannel();
-            debugOutput.appendLine(`\n=== RESET CONNECTION (${new Date().toLocaleString()}) ===`);
+            getDebugChannel().appendLine(`\n=== RESET CONNECTION (${new Date().toLocaleString()}) ===`);
         }
 
-        // Close existing connection
         await this.close();
 
-        // Clear captured endpoints
         this.apiEndpoint = null;
         this.apiHeaders = null;
         this.creditsEndpoint = null;
@@ -729,70 +610,33 @@ class ClaudeUsageScraper {
         this.capturedEndpoints = [];
 
         if (debug) {
-            const debugOutput = getDebugChannel();
-            debugOutput.appendLine('Browser connection closed');
-            debugOutput.appendLine('All captured API endpoints cleared');
-            debugOutput.appendLine('Ready for fresh connection on next fetch');
+            getDebugChannel().appendLine('Browser connection closed');
+            getDebugChannel().appendLine('All captured API endpoints cleared');
         }
 
         return { success: true, message: 'Connection reset successfully' };
     }
 
     /**
-     * Clear session completely - delete stored browser session data
-     * Use this when login fails and you need to start fresh
-     * @returns {Promise<{success: boolean, message: string}>}
+     * Clear session (delegate to auth + reset)
+     * @returns {Promise<object>}
      */
     async clearSession() {
-        const debug = isDebugEnabled();
-        if (debug) {
-            const debugOutput = getDebugChannel();
-            debugOutput.appendLine(`\n=== CLEAR SESSION (${new Date().toLocaleString()}) ===`);
-        }
-
-        // First reset the connection
         await this.reset();
-
-        // Then delete the session directory
-        try {
-            if (fs.existsSync(this.sessionDir)) {
-                fs.rmSync(this.sessionDir, { recursive: true, force: true });
-                if (debug) {
-                    const debugOutput = getDebugChannel();
-                    debugOutput.appendLine(`Deleted session directory: ${this.sessionDir}`);
-                }
-            }
-        } catch (error) {
-            console.error('Failed to delete session directory:', error);
-            if (debug) {
-                const debugOutput = getDebugChannel();
-                debugOutput.appendLine(`Failed to delete session directory: ${error.message}`);
-            }
-            return { success: false, message: `Failed to clear session: ${error.message}` };
-        }
-
-        if (debug) {
-            const debugOutput = getDebugChannel();
-            debugOutput.appendLine('Session cleared - next fetch will prompt for fresh login');
-        }
-
-        return { success: true, message: 'Session cleared successfully. Next fetch will prompt for login.' };
+        return await this.auth.clearSession();
     }
 
     /**
-     * Force open browser in headed (visible) mode for login
-     * Closes any existing browser and relaunches visibly
-     * @returns {Promise<{success: boolean, message: string}>}
+     * Force open browser in headed mode for login
+     * @returns {Promise<object>}
      */
     async forceOpenBrowser() {
         const debug = isDebugEnabled();
         if (debug) {
-            const debugOutput = getDebugChannel();
-            debugOutput.appendLine(`\n=== FORCE OPEN BROWSER (${new Date().toLocaleString()}) ===`);
+            getDebugChannel().appendLine(`\n=== FORCE OPEN BROWSER (${new Date().toLocaleString()}) ===`);
         }
 
         try {
-            // Close existing browser if any
             if (this.browser) {
                 try {
                     if (this.isConnectedBrowser) {
@@ -808,32 +652,32 @@ class ClaudeUsageScraper {
                 this.isInitialized = false;
             }
 
-            // Launch browser in headed mode (visible)
-            const executablePath = this.findChrome();
+            const chromePath = this.findChrome();
+
+            if (!chromePath) {
+                throw new Error('CHROME_NOT_FOUND');
+            }
+
+            // Get a fresh available port
+            this.browserPort = await this.findAvailablePort();
+
             const launchOptions = {
-                headless: false, // Force visible
+                headless: false,
                 userDataDir: this.sessionDir,
+                executablePath: chromePath,
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
                     '--disable-blink-features=AutomationControlled',
-                    `--remote-debugging-port=${this.debugPort}`
+                    `--remote-debugging-port=${this.browserPort}`
                 ],
-                defaultViewport: {
-                    width: 1280,
-                    height: 800
-                }
+                defaultViewport: { width: VIEWPORT.WIDTH, height: VIEWPORT.HEIGHT }
             };
 
-            if (executablePath) {
-                launchOptions.executablePath = executablePath;
-            }
-
             if (debug) {
-                const debugOutput = getDebugChannel();
-                debugOutput.appendLine(`Launching headed browser...`);
-                debugOutput.appendLine(`Executable: ${executablePath || 'default'}`);
+                getDebugChannel().appendLine(`Launching headed Chrome browser...`);
+                getDebugChannel().appendLine(`Executable: ${chromePath}`);
             }
 
             this.browser = await puppeteer.launch(launchOptions);
@@ -847,34 +691,34 @@ class ClaudeUsageScraper {
 
             this.isInitialized = true;
             this.isConnectedBrowser = false;
+            this.auth.setPageAndBrowser(this.page, this.browser);
 
-            // Navigate to login page
-            await this.page.goto('https://claude.ai/login', {
+            await this.page.goto(CLAUDE_URLS.LOGIN, {
                 waitUntil: 'networkidle2',
-                timeout: 30000
+                timeout: TIMEOUTS.PAGE_LOAD
             });
 
             if (debug) {
-                const debugOutput = getDebugChannel();
-                debugOutput.appendLine('Browser opened successfully - awaiting login');
+                getDebugChannel().appendLine('Browser opened successfully - awaiting login');
             }
 
             return { success: true, message: 'Browser opened. Please log in to Claude.ai.' };
         } catch (error) {
             if (debug) {
-                const debugOutput = getDebugChannel();
-                debugOutput.appendLine(`Failed to open browser: ${error.message}`);
+                getDebugChannel().appendLine(`Failed to open browser: ${error.message}`);
             }
             return { success: false, message: `Failed to open browser: ${error.message}` };
         }
     }
 
     /**
-     * Get diagnostic information about current state
-     * @returns {object} Diagnostic info
+     * Get diagnostic information
+     * @returns {object}
      */
     getDiagnostics() {
         const schemaInfo = getSchemaInfo();
+        const authDiag = this.auth.getDiagnostics();
+
         return {
             isInitialized: this.isInitialized,
             isConnectedBrowser: this.isConnectedBrowser,
@@ -885,9 +729,7 @@ class ClaudeUsageScraper {
             hasCreditsEndpoint: !!this.creditsEndpoint,
             hasOverageEndpoint: !!this.overageEndpoint,
             capturedEndpointsCount: this.capturedEndpoints?.length || 0,
-            sessionDir: this.sessionDir,
-            hasExistingSession: this.hasExistingSession(),
-            // Schema info for debugging API changes
+            ...authDiag,
             schemaVersion: schemaInfo.version,
             schemaFields: schemaInfo.usageFields,
             schemaEndpoints: schemaInfo.endpoints,
@@ -895,4 +737,9 @@ class ClaudeUsageScraper {
     }
 }
 
-module.exports = { ClaudeUsageScraper, getDebugChannel, setDevMode };
+// Re-export from utils for backwards compatibility
+module.exports = {
+    ClaudeUsageScraper,
+    getDebugChannel,
+    setDevMode
+};

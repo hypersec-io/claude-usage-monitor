@@ -1,6 +1,7 @@
 const fs = require('fs').promises;
 const path = require('path');
 const os = require('os');
+const { getTokenLimit, TIMEOUTS } = require('./utils');
 
 /**
  * Loads and parses Claude Code's JSONL usage data files
@@ -295,9 +296,9 @@ class ClaudeDataLoader {
      */
     async getCurrentSessionUsage() {
         console.log('🔍 getCurrentSessionUsage() - extracting cache size from most recent message');
-        // Use 1 hour window - session stays "active" as long as file was touched recently
+        // Use session duration window - session stays "active" as long as file was touched recently
         // This prevents the Tk display from flickering to "-" during pauses in conversation
-        const oneHourAgo = Date.now() - (60 * 60 * 1000);
+        const sessionStart = Date.now() - TIMEOUTS.SESSION_DURATION;
 
         // Try project-specific directory first, fall back to global
         let dataDir = await this.getProjectDataDirectory();
@@ -330,7 +331,7 @@ class ClaudeDataLoader {
             for (const filePath of allJsonlFiles) {
                 try {
                     const stats = await fs.stat(filePath);
-                    if (stats.mtimeMs >= oneHourAgo) {
+                    if (stats.mtimeMs >= sessionStart) {
                         recentFiles.push({
                             path: filePath,
                             modified: stats.mtimeMs
@@ -395,7 +396,7 @@ class ClaudeDataLoader {
                             console.log(`   Cache creation: ${cacheCreation.toLocaleString()}`);
                             console.log(`   Cache read: ${cacheRead.toLocaleString()}`);
                             console.log(`   Session total (using cache_read only): ${sessionTokens.toLocaleString()} tokens`);
-                            console.log(`   Percentage: ${((sessionTokens / 200000) * 100).toFixed(2)}%`);
+                            console.log(`   Percentage: ${((sessionTokens / getTokenLimit()) * 100).toFixed(2)}%`);
 
                             break;
                         }

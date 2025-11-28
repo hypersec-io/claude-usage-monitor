@@ -1,6 +1,5 @@
 const fs = require('fs').promises;
-const path = require('path');
-const os = require('os');
+const { PATHS, getTokenLimit } = require('./utils');
 
 /**
  * Simple session tracker for Claude Code development sessions
@@ -13,7 +12,7 @@ const os = require('os');
 class SessionTracker {
     constructor(sessionFilePath) {
         // Store in OS temp directory so it's accessible regardless of where extension is installed
-        this.sessionFilePath = sessionFilePath || path.join(os.tmpdir(), 'claude-session-data.json');
+        this.sessionFilePath = sessionFilePath || PATHS.SESSION_DATA_FILE;
         this.currentSession = null;
     }
 
@@ -57,14 +56,15 @@ class SessionTracker {
         const sessionNumber = String(data.sessions.length + 1).padStart(3, '0');
         const date = new Date().toISOString().split('T')[0];
 
+        const tokenLimit = getTokenLimit();
         this.currentSession = {
             sessionId: `session-${date}-${sessionNumber}`,
             startTime: new Date().toISOString(),
             description: description,
             tokenUsage: {
                 current: 0,
-                limit: 200000,
-                remaining: 200000,
+                limit: tokenLimit,
+                remaining: tokenLimit,
                 lastUpdate: new Date().toISOString()
             }
         };
@@ -80,9 +80,11 @@ class SessionTracker {
     /**
      * Update token usage for current session
      * @param {number} tokensUsed - Current token count
-     * @param {number} tokenLimit - Token limit (default 200000)
+     * @param {number} tokenLimit - Token limit (uses configured setting if not provided)
      */
-    async updateTokens(tokensUsed, tokenLimit = 200000) {
+    async updateTokens(tokensUsed, tokenLimit = null) {
+        // Use provided limit or get from settings
+        const limit = tokenLimit || getTokenLimit();
         const data = await this.loadData();
 
         // Find current session (last one if currentSession not set)
@@ -93,8 +95,8 @@ class SessionTracker {
         }
 
         session.tokenUsage.current = tokensUsed;
-        session.tokenUsage.limit = tokenLimit;
-        session.tokenUsage.remaining = tokenLimit - tokensUsed;
+        session.tokenUsage.limit = limit;
+        session.tokenUsage.remaining = limit - tokensUsed;
         session.tokenUsage.lastUpdate = new Date().toISOString();
 
         // Update totals

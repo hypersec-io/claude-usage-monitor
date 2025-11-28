@@ -4,6 +4,7 @@ const { createStatusBarItem, updateStatusBar, startSpinner, stopSpinner } = requ
 const { ActivityMonitor } = require('./src/activityMonitor');
 const { SessionTracker } = require('./src/sessionTracker');
 const { ClaudeDataLoader } = require('./src/claudeDataLoader');
+const { CONFIG_NAMESPACE, COMMANDS, getTokenLimit, setDevMode, isDebugEnabled, getDebugChannel, disposeDebugChannel } = require('./src/utils');
 
 let statusBarItem;
 let dataProvider;
@@ -12,17 +13,6 @@ let activityMonitor;
 let sessionTracker;
 let claudeDataLoader;
 let jsonlWatcher;
-
-// Track if we're running in development mode
-let runningInDevMode = false;
-
-// Helper to check if debug mode is enabled (config setting OR dev mode)
-function isDebugMode(context) {
-    if (context?.extensionMode === vscode.ExtensionMode.Development) return true;
-    if (runningInDevMode) return true;
-    const config = vscode.workspace.getConfiguration('claudeUsage');
-    return config.get('debug', false);
-}
 
 // Lazy-created diagnostic channel for token monitoring
 let tokenDiagnosticChannel = null;
@@ -38,9 +28,69 @@ function getTokenDiagnosticChannel() {
  * @param {string} message - Message to log
  */
 function debugLog(message) {
-    if (runningInDevMode || vscode.workspace.getConfiguration('claudeUsage').get('debug', false)) {
+    if (isDebugEnabled()) {
         getTokenDiagnosticChannel().appendLine(message);
     }
+}
+
+/**
+ * Perform a usage fetch with spinner and error handling
+ * @returns {Promise<{webError: Error|null, tokenError: Error|null}>}
+ */
+async function performFetch() {
+    let webError = null;
+    let tokenError = null;
+
+    try {
+        startSpinner();
+        const result = await dataProvider.fetchUsage();
+        webError = result.webError;
+
+        // Check if token data is available
+        const sessionData = sessionTracker ? await sessionTracker.getCurrentSession() : null;
+        if (!sessionData || !sessionData.tokenUsage) {
+            tokenError = new Error('No token data available');
+        }
+    } catch (error) {
+        webError = webError || error;
+        console.error('Failed to fetch usage:', error);
+    } finally {
+        stopSpinner(webError, tokenError);
+        // Update status bar AFTER spinner stops so tooltip gets set correctly
+        await updateStatusBarWithAllData();
+    }
+
+    return { webError, tokenError };
+}
+
+/**
+ * Helper function to update status bar and tree view with all data
+ */
+async function updateStatusBarWithAllData() {
+    const sessionData = sessionTracker ? await sessionTracker.getCurrentSession() : null;
+    const activityStats = activityMonitor ? activityMonitor.getStats(dataProvider.usageData, sessionData) : null;
+    updateStatusBar(statusBarItem, dataProvider.usageData, activityStats, sessionData);
+
+    // Update tree view with session data and activity stats
+    dataProvider.updateSessionData(sessionData, activityStats);
+}
+
+/**
+ * Create auto-refresh timer
+ * @param {number} minutes - Interval in minutes (1-60)
+ * @returns {NodeJS.Timer|null}
+ */
+function createAutoRefreshTimer(minutes) {
+    // Validate and clamp to 1-60 minute range
+    const clampedMinutes = Math.max(1, Math.min(60, minutes));
+
+    if (clampedMinutes <= 0) return null;
+
+    console.log(`Auto-refresh enabled: checking usage every ${clampedMinutes} minutes`);
+
+    return setInterval(async () => {
+        await performFetch();
+    }, clampedMinutes * 60 * 1000);
 }
 
 /**
@@ -153,7 +203,7 @@ async function updateTokensFromJsonl(silent = false) {
                         currentSession = await sessionTracker.startSession('Claude Code session (auto-created)');
                         debugLog(`✨ Created new session: ${currentSession.sessionId}`);
                     }
-                    await sessionTracker.updateTokens(usage.totalTokens, 200000);
+                    await sessionTracker.updateTokens(usage.totalTokens, getTokenLimit());
                 }
 
                 const sessionData = await sessionTracker.getCurrentSession();
@@ -183,9 +233,7 @@ async function updateTokensFromJsonl(silent = false) {
  */
 async function activate(context) {
     // Enable debug mode if running in Extension Development Host (F5)
-    const { setDevMode } = require('./src/scraper');
     if (context.extensionMode === vscode.ExtensionMode.Development) {
-        runningInDevMode = true;
         setDevMode(true);
     }
 
@@ -205,56 +253,41 @@ async function activate(context) {
     // Monitor for Claude Code token usage updates via JSONL files
     await setupTokenMonitoring(context);
 
-    // Helper function to update status bar and tree view with all data
-    async function updateStatusBarWithAllData() {
-        const sessionData = sessionTracker ? await sessionTracker.getCurrentSession() : null;
-        const activityStats = activityMonitor ? activityMonitor.getStats(dataProvider.usageData, sessionData) : null;
-        updateStatusBar(statusBarItem, dataProvider.usageData, activityStats, sessionData);
-
-        // Update tree view with session data and activity stats
-        dataProvider.updateSessionData(sessionData, activityStats);
-    }
-
     // Register tree data provider
     const treeView = vscode.window.createTreeView('claude-usage-view', {
         treeDataProvider: dataProvider
     });
     context.subscriptions.push(treeView);
 
+    // Register disposal for Puppeteer browser - ensures it closes when extension stops
+    context.subscriptions.push({
+        dispose: () => {
+            if (dataProvider && dataProvider.scraper) {
+                dataProvider.scraper.close().catch(err => {
+                    console.error('Error closing browser on dispose:', err);
+                });
+            }
+        }
+    });
+
     // Register commands
     context.subscriptions.push(
-        vscode.commands.registerCommand('claude-usage.fetchNow', async () => {
-            let webError = null;
-            let tokenError = null;
-            try {
-                startSpinner();
-                const result = await dataProvider.fetchUsage();
-                webError = result.webError;
-
-                // Check if token data is available
-                const sessionData = sessionTracker ? await sessionTracker.getCurrentSession() : null;
-                if (!sessionData || !sessionData.tokenUsage) {
-                    tokenError = new Error('No token data available');
-                }
-
-                await updateStatusBarWithAllData();
-            } catch (error) {
-                webError = webError || error;
-                vscode.window.showErrorMessage(`Failed to fetch Claude usage: ${error.message}`);
-            } finally {
-                stopSpinner(webError, tokenError);
+        vscode.commands.registerCommand(COMMANDS.FETCH_NOW, async () => {
+            const { webError } = await performFetch();
+            if (webError) {
+                vscode.window.showErrorMessage(`Failed to fetch Claude usage: ${webError.message}`);
             }
         })
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('claude-usage.openSettings', async () => {
+        vscode.commands.registerCommand(COMMANDS.OPEN_SETTINGS, async () => {
             await vscode.env.openExternal(vscode.Uri.parse('https://claude.ai/settings'));
         })
     );
 
     context.subscriptions.push(
-        vscode.commands.registerCommand('claude-usage.startNewSession', async () => {
+        vscode.commands.registerCommand(COMMANDS.START_SESSION, async () => {
             try {
                 // Prompt user for optional session description
                 const description = await vscode.window.showInputBox({
@@ -286,8 +319,7 @@ async function activate(context) {
 
     // Show Debug Output command
     context.subscriptions.push(
-        vscode.commands.registerCommand('claude-usage.showDebug', async () => {
-            const { getDebugChannel } = require('./src/scraper');
+        vscode.commands.registerCommand(COMMANDS.SHOW_DEBUG, async () => {
             const debugChannel = getDebugChannel();
 
             // Add diagnostic info
@@ -330,7 +362,7 @@ async function activate(context) {
 
     // Reset Connection command
     context.subscriptions.push(
-        vscode.commands.registerCommand('claude-usage.resetConnection', async () => {
+        vscode.commands.registerCommand(COMMANDS.RESET_CONNECTION, async () => {
             try {
                 if (dataProvider && dataProvider.scraper) {
                     const result = await dataProvider.scraper.reset();
@@ -348,7 +380,7 @@ async function activate(context) {
 
     // Clear Session command - deletes stored browser session for fresh login
     context.subscriptions.push(
-        vscode.commands.registerCommand('claude-usage.clearSession', async () => {
+        vscode.commands.registerCommand(COMMANDS.CLEAR_SESSION, async () => {
             try {
                 if (dataProvider && dataProvider.scraper) {
                     const confirm = await vscode.window.showWarningMessage(
@@ -372,7 +404,7 @@ async function activate(context) {
 
     // Open Browser command - force open browser for login
     context.subscriptions.push(
-        vscode.commands.registerCommand('claude-usage.openBrowser', async () => {
+        vscode.commands.registerCommand(COMMANDS.OPEN_BROWSER, async () => {
             try {
                 if (dataProvider && dataProvider.scraper) {
                     vscode.window.showInformationMessage('Opening browser for Claude.ai login...');
@@ -392,70 +424,23 @@ async function activate(context) {
     );
 
     // Get configuration
-    const config = vscode.workspace.getConfiguration('claudeUsage');
+    const config = vscode.workspace.getConfiguration(CONFIG_NAMESPACE);
 
     // Fetch on startup if configured
     if (config.get('fetchOnStartup', true)) {
         setTimeout(async () => {
-            let webError = null;
-            let tokenError = null;
-            try {
-                startSpinner();
-                const result = await dataProvider.fetchUsage();
-                webError = result.webError;
-
-                // Check if token data is available
-                const sessionData = sessionTracker ? await sessionTracker.getCurrentSession() : null;
-                if (!sessionData || !sessionData.tokenUsage) {
-                    tokenError = new Error('No token data available');
-                }
-
-                await updateStatusBarWithAllData();
-            } catch (error) {
-                webError = webError || error;
-                console.error('Failed to fetch usage on startup:', error);
-            } finally {
-                stopSpinner(webError, tokenError);
-            }
+            await performFetch();
         }, 2000); // Wait 2 seconds after activation
     }
 
     // Set up auto-refresh interval for usage checks
-    let autoRefreshMinutes = config.get('autoRefreshMinutes', 5);
-    // Validate and clamp to 1-60 minute range
-    autoRefreshMinutes = Math.max(1, Math.min(60, autoRefreshMinutes));
-
-    if (autoRefreshMinutes > 0) {
-        autoRefreshTimer = setInterval(async () => {
-            let webError = null;
-            let tokenError = null;
-            try {
-                startSpinner();
-                const result = await dataProvider.fetchUsage();
-                webError = result.webError;
-
-                // Check if token data is available
-                const sessionData = sessionTracker ? await sessionTracker.getCurrentSession() : null;
-                if (!sessionData || !sessionData.tokenUsage) {
-                    tokenError = new Error('No token data available');
-                }
-
-                await updateStatusBarWithAllData();
-            } catch (error) {
-                webError = webError || error;
-                console.error('Failed to auto-refresh usage:', error);
-            } finally {
-                stopSpinner(webError, tokenError);
-            }
-        }, autoRefreshMinutes * 60 * 1000);
-
-        console.log(`Auto-refresh enabled: checking usage every ${autoRefreshMinutes} minutes`);
-    }
+    const autoRefreshMinutes = config.get('autoRefreshMinutes', 5);
+    autoRefreshTimer = createAutoRefreshTimer(autoRefreshMinutes);
 
     // Listen for configuration changes
     context.subscriptions.push(
         vscode.workspace.onDidChangeConfiguration(e => {
-            if (e.affectsConfiguration('claudeUsage.autoRefreshMinutes')) {
+            if (e.affectsConfiguration(`${CONFIG_NAMESPACE}.autoRefreshMinutes`)) {
                 // Clear existing timer
                 if (autoRefreshTimer) {
                     clearInterval(autoRefreshTimer);
@@ -463,40 +448,17 @@ async function activate(context) {
                 }
 
                 // Restart with new configuration
-                const newConfig = vscode.workspace.getConfiguration('claudeUsage');
-                let newAutoRefresh = newConfig.get('autoRefreshMinutes', 5);
-                // Validate and clamp to 1-60 minute range
-                newAutoRefresh = Math.max(1, Math.min(60, newAutoRefresh));
-
-                if (newAutoRefresh > 0) {
-                    autoRefreshTimer = setInterval(async () => {
-                        let webError = null;
-                        let tokenError = null;
-                        try {
-                            startSpinner();
-                            const result = await dataProvider.fetchUsage();
-                            webError = result.webError;
-
-                            // Check if token data is available
-                            const sessionData = sessionTracker ? await sessionTracker.getCurrentSession() : null;
-                            if (!sessionData || !sessionData.tokenUsage) {
-                                tokenError = new Error('No token data available');
-                            }
-
-                            await updateStatusBarWithAllData();
-                        } catch (error) {
-                            webError = webError || error;
-                            console.error('Failed to auto-refresh usage:', error);
-                        } finally {
-                            stopSpinner(webError, tokenError);
-                        }
-                    }, newAutoRefresh * 60 * 1000);
-
-                    console.log(`Auto-refresh interval updated to ${newAutoRefresh} minutes`);
-                }
+                const newConfig = vscode.workspace.getConfiguration(CONFIG_NAMESPACE);
+                const newAutoRefresh = newConfig.get('autoRefreshMinutes', 5);
+                autoRefreshTimer = createAutoRefreshTimer(newAutoRefresh);
             }
         })
     );
+
+    // Register disposal of debug channel
+    context.subscriptions.push({
+        dispose: () => disposeDebugChannel()
+    });
 }
 
 async function deactivate() {

@@ -1,3 +1,5 @@
+/** @format */
+
 /**
  * Calculates activity level based on Claude.ai usage and session token usage
  * to show how much "Claude time" remains
@@ -71,7 +73,17 @@ class ActivityMonitor {
     }
 
     /**
+     * Pick a random message from an array
+     * @param {string[]} messages - Array of possible messages
+     * @returns {string}
+     */
+    pickRandom(messages) {
+        return messages[Math.floor(Math.random() * messages.length)];
+    }
+
+    /**
      * Get human-readable description of activity level
+     * Includes fun pop culture references from 80s, movies, games, etc.
      * @param {string} level
      * @param {number} claudePercent
      * @param {number} tokenPercent
@@ -81,19 +93,75 @@ class ActivityMonitor {
         const descriptions = {
             'heavy': {
                 short: 'Running low!',
-                quirky: 'Claude needs a coffee break soon ☕'
+                quirkyOptions: [
+                    'Claude needs a coffee break soon ☕',
+                    "I'm sorry Dave, I'm afraid I can't do much more 🔴",
+                    'GAME OVER, man! GAME OVER! 👾',
+                    "We're gonna need a bigger boatload of tokens 🦈",
+                    'Roads? Where we\'re going we need... more tokens ⚡',
+                    'This is heavy, Doc! 🚗',
+                    "I'll be back... after the reset 🤖",
+                    'Danger Will Robinson! Token levels critical! 🚨',
+                    'Houston, we have a problem 🚀',
+                    'My capacitor is almost out of flux ⚡',
+                    'Luke, I am your... context limit 🌑',
+                    'Hasta la vista, tokens 💀',
+                    'Winter is coming... for your context ❄️',
+                    'You shall not pass... (90%) 🧙',
+                    'I\'ve got a bad feeling about this, Chewie 😰',
+                    'You call that a token limit? THIS is a token limit 🔪',
+                    'Crikey! Token levels are getting dangerous! 🐊'
+                ]
             },
             'moderate': {
                 short: 'Getting low',
-                quirky: 'Pace yourself, human 🐢'
+                quirkyOptions: [
+                    'Pace yourself, human 🐢',
+                    'These aren\'t the tokens you\'re looking for... yet 👋',
+                    'Life moves pretty fast. Token consumption too 🎸',
+                    'May the tokens be with you 🌟',
+                    'The tokens are strong with this one... but struggling 🌟',
+                    'One does not simply ignore token warnings 💍',
+                    'Wax on, tokens off 🥋',
+                    'Strange things are afoot at the Claude-K 🎸',
+                    'Be excellent to your token budget 🎸',
+                    'Party on, but watch those tokens 🤘',
+                    'Inconceivable! We\'re at 75% already! 🗡️',
+                    'With great prompts comes great token usage 🕷️'
+                ]
             },
             'idle': {
                 short: 'Normal usage',
-                quirky: 'Plenty of Claude time remaining 🚀'
+                quirkyOptions: [
+                    'Plenty of Claude time remaining 🚀',
+                    'All systems nominal, Captain 🖖',
+                    'Stay awhile and code 📜',
+                    'The Force is strong with your quota 🌟',
+                    'Groovy! Tokens looking good 😎',
+                    'Excellent! *air guitar* 🎸',
+                    'Righteous! Totally tubular token levels 🏄',
+                    'Cowabunga, dude! 🐢',
+                    'I love it when a plan comes together 🚐',
+                    'Token levels: Bodacious! 🤙',
+                    'Radical! Claude is ready to rock 🎸',
+                    'You\'ve got the power! 💪',
+                    'Autobots, roll out! 🚗',
+                    'It\'s-a me, Claude-io! 🍄',
+                    'Achievement unlocked: Good token hygiene 🎮',
+                    'To infinity and beyond! 🚀',
+                    'Here\'s looking at you, coder 🎩',
+                    'You\'re gonna need a... wait, no, you\'re fine 👍',
+                    'Fasten your seatbelts, plenty of tokens ahead ✈️'
+                ]
             }
         };
 
-        return descriptions[level] || { short: '', quirky: '' };
+        const levelDescriptions = descriptions[level] || descriptions['idle'];
+
+        return {
+            short: levelDescriptions.short,
+            quirky: this.pickRandom(levelDescriptions.quirkyOptions)
+        };
     }
 }
 

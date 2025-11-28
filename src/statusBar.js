@@ -1,29 +1,42 @@
 const vscode = require('vscode');
-const { calculateResetClockTime } = require('./utils');
+const { COMMANDS, CONFIG_NAMESPACE, calculateResetClockTime, getCurrencySymbol } = require('./utils');
+
+// Status bar label options
+const LABEL_TEXT = 'Claude';
+const LABEL_ICON = '$(pulse)';
 
 /**
- * Get currency symbol for a currency code
- * @param {string} currency - ISO 4217 currency code
- * @returns {string} Currency symbol
+ * Get the label text based on user setting
+ * @returns {string|null} Text, icon, or null for hidden
  */
-function getCurrencySymbol(currency) {
-    const symbols = {
-        USD: '$', AUD: '$', CAD: '$', EUR: '€', GBP: '£',
-        JPY: '¥', CNY: '¥', KRW: '₩', INR: '₹', BRL: 'R$',
-        MXN: '$', CHF: 'CHF ', SEK: 'kr', NOK: 'kr', DKK: 'kr',
-        NZD: '$', SGD: '$', HKD: '$',
-    };
-    return symbols[currency] || '';
+function getLabelText() {
+    const config = vscode.workspace.getConfiguration(CONFIG_NAMESPACE);
+    const style = config.get('statusBar.labelStyle', 'text');
+    switch (style) {
+        case 'icon': return LABEL_ICON;
+        case 'none': return null;
+        default: return LABEL_TEXT;
+    }
+}
+
+/**
+ * Check if label should be shown
+ * @returns {boolean}
+ */
+function shouldShowLabel() {
+    const config = vscode.workspace.getConfiguration(CONFIG_NAMESPACE);
+    return config.get('statusBar.labelStyle', 'text') !== 'none';
 }
 
 // Braille spinner frames
 const spinnerFrames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 let spinnerIndex = 0;
 let spinnerInterval = null;
+let isSpinnerActive = false;
 
 // Store references to all status bar items
 let statusBarItems = {
-    label: null,      // "Claude" label
+    label: null,      // "Claude Monitor" label
     session: null,    // 5hr session usage
     weekly: null,     // 7d weekly usage
     sonnet: null,     // Sonnet weekly (optional)
@@ -55,14 +68,17 @@ function createStatusBarItem(context) {
     // and avoid other extensions inserting between our items
     const basePriority = 1000;
 
-    // Label item (leftmost = highest priority)
+    // Label item (leftmost = highest priority) - only if enabled
     statusBarItems.label = vscode.window.createStatusBarItem(
         vscode.StatusBarAlignment.Right,
         basePriority
     );
-    statusBarItems.label.command = 'claude-usage.fetchNow';
-    statusBarItems.label.text = 'Claude  ';  // Space placeholder for spinner
-    statusBarItems.label.show();
+    statusBarItems.label.command = COMMANDS.FETCH_NOW;
+    const labelText = getLabelText();
+    if (labelText) {
+        statusBarItems.label.text = `${labelText}  `;  // Space placeholder for spinner
+        statusBarItems.label.show();
+    }
     context.subscriptions.push(statusBarItems.label);
 
     // Session (5hr) usage
@@ -70,7 +86,7 @@ function createStatusBarItem(context) {
         vscode.StatusBarAlignment.Right,
         basePriority - 1
     );
-    statusBarItems.session.command = 'claude-usage.fetchNow';
+    statusBarItems.session.command = COMMANDS.FETCH_NOW;
     context.subscriptions.push(statusBarItems.session);
 
     // Weekly (7d) usage
@@ -78,7 +94,7 @@ function createStatusBarItem(context) {
         vscode.StatusBarAlignment.Right,
         basePriority - 2
     );
-    statusBarItems.weekly.command = 'claude-usage.fetchNow';
+    statusBarItems.weekly.command = COMMANDS.FETCH_NOW;
     context.subscriptions.push(statusBarItems.weekly);
 
     // Sonnet weekly usage (optional)
@@ -86,7 +102,7 @@ function createStatusBarItem(context) {
         vscode.StatusBarAlignment.Right,
         basePriority - 3
     );
-    statusBarItems.sonnet.command = 'claude-usage.fetchNow';
+    statusBarItems.sonnet.command = COMMANDS.FETCH_NOW;
     context.subscriptions.push(statusBarItems.sonnet);
 
     // Opus weekly usage (optional, Max plans only)
@@ -94,7 +110,7 @@ function createStatusBarItem(context) {
         vscode.StatusBarAlignment.Right,
         basePriority - 4
     );
-    statusBarItems.opus.command = 'claude-usage.fetchNow';
+    statusBarItems.opus.command = COMMANDS.FETCH_NOW;
     context.subscriptions.push(statusBarItems.opus);
 
     // Extra usage / credits
@@ -102,7 +118,7 @@ function createStatusBarItem(context) {
         vscode.StatusBarAlignment.Right,
         basePriority - 5
     );
-    statusBarItems.credits.command = 'claude-usage.fetchNow';
+    statusBarItems.credits.command = COMMANDS.FETCH_NOW;
     context.subscriptions.push(statusBarItems.credits);
 
     // Token usage (rightmost = lowest priority, always at end)
@@ -110,7 +126,7 @@ function createStatusBarItem(context) {
         vscode.StatusBarAlignment.Right,
         basePriority - 6
     );
-    statusBarItems.tokens.command = 'claude-usage.fetchNow';
+    statusBarItems.tokens.command = COMMANDS.FETCH_NOW;
     context.subscriptions.push(statusBarItems.tokens);
 
     // Return the label item for backwards compatibility
@@ -148,7 +164,7 @@ function getIconAndColor(percent, warningThreshold = 75, errorThreshold = 90) {
  */
 function updateStatusBar(item, usageData, activityStats = null, sessionData = null) {
     // Get settings
-    const config = vscode.workspace.getConfiguration('claudeUsage');
+    const config = vscode.workspace.getConfiguration(CONFIG_NAMESPACE);
     const showSession = config.get('statusBar.showSession', true);
     const showWeekly = config.get('statusBar.showWeekly', true);
     const showSonnet = config.get('statusBar.showSonnet', false);
@@ -168,10 +184,16 @@ function updateStatusBar(item, usageData, activityStats = null, sessionData = nu
 
     // If no data at all, show default and hide all metric items
     if (!usageData && !sessionData) {
-        statusBarItems.label.text = 'Claude  ';  // Space placeholder for spinner
-        statusBarItems.label.tooltip = 'Click to fetch Claude usage data';
-        statusBarItems.label.color = undefined;
-        // Hide all items at end
+        // Don't overwrite during spinner animation
+        if (!isSpinnerActive) {
+            const labelText = getLabelText();
+            if (labelText && statusBarItems.label) {
+                statusBarItems.label.text = `${labelText}  `;
+                statusBarItems.label.color = undefined;
+            }
+            setAllTooltips('Click to fetch Claude usage data');
+        }
+        // Hide all metric items
         statusBarItems.session.hide();
         statusBarItems.weekly.hide();
         statusBarItems.sonnet.hide();
@@ -181,9 +203,14 @@ function updateStatusBar(item, usageData, activityStats = null, sessionData = nu
         return;
     }
 
-    // Reset label
-    statusBarItems.label.text = 'Claude  ';  // Space placeholder for spinner
-    statusBarItems.label.color = undefined;
+    // Reset label (but not during spinner animation)
+    if (!isSpinnerActive) {
+        const labelText = getLabelText();
+        if (labelText && statusBarItems.label) {
+            statusBarItems.label.text = `${labelText}  `;
+            statusBarItems.label.color = undefined;
+        }
+    }
 
     // Build shared tooltip
     const tooltipLines = [];
@@ -220,10 +247,7 @@ function updateStatusBar(item, usageData, activityStats = null, sessionData = nu
             newTokensColor = color;
             tokensVisible = true;
 
-            // Tooltip (always show)
-            if (tooltipLines.length > 0 && !tooltipLines[tooltipLines.length - 1].startsWith('**Session')) {
-                tooltipLines.push('');
-            }
+            // Tooltip - add right after Session header (no gap)
             tooltipLines.push(`Tokens: ${sessionData.tokenUsage.current.toLocaleString()} / ${sessionData.tokenUsage.limit.toLocaleString()} (${tokenPercent}%)`);
         } else {
             // Show placeholder when no token data
@@ -335,15 +359,12 @@ function updateStatusBar(item, usageData, activityStats = null, sessionData = nu
     }
     tooltipLines.push('Click to refresh');
 
-    // Apply tooltip to all items (tooltip changes don't cause flicker)
+    // Apply tooltip to ALL items (tooltip changes don't cause flicker)
+    // But don't overwrite during spinner animation
     const markdown = new vscode.MarkdownString(tooltipLines.join('  \n'));
-    statusBarItems.label.tooltip = markdown;
-    statusBarItems.session.tooltip = markdown;
-    statusBarItems.weekly.tooltip = markdown;
-    statusBarItems.sonnet.tooltip = markdown;
-    statusBarItems.opus.tooltip = markdown;
-    statusBarItems.tokens.tooltip = markdown;
-    statusBarItems.credits.tooltip = markdown;
+    if (!isSpinnerActive) {
+        setAllTooltips(markdown);
+    }
 
     // Only update status bar items if values actually changed (prevents flicker)
     if (newSessionText !== lastDisplayedValues.sessionText) {
@@ -414,24 +435,45 @@ function updateStatusBar(item, usageData, activityStats = null, sessionData = nu
 }
 
 /**
- * Start the loading spinner animation on the Claude label
+ * Set tooltip on all visible status bar items
+ * @param {string|vscode.MarkdownString} tooltip
+ */
+function setAllTooltips(tooltip) {
+    Object.values(statusBarItems).forEach(item => {
+        if (item) {
+            item.tooltip = tooltip;
+        }
+    });
+}
+
+/**
+ * Start the loading spinner animation
+ * Shows spinner on label (if visible) and sets "Checking Claude..." tooltip on all items
  */
 function startSpinner() {
     if (spinnerInterval) return; // Already running
 
     spinnerIndex = 0;
-    spinnerInterval = setInterval(() => {
-        if (statusBarItems.label) {
-            statusBarItems.label.text = `Claude ${spinnerFrames[spinnerIndex]}`;
-        }
-        spinnerIndex = (spinnerIndex + 1) % spinnerFrames.length;
-    }, 80); // Fast smooth animation
+    isSpinnerActive = true;
+
+    // Set tooltip on ALL visible status bar items
+    setAllTooltips('Checking Claude...');
+
+    // Only animate spinner if label is visible
+    const labelText = getLabelText();
+    if (labelText && statusBarItems.label) {
+        spinnerInterval = setInterval(() => {
+            statusBarItems.label.text = `${labelText} ${spinnerFrames[spinnerIndex]}`;
+            spinnerIndex = (spinnerIndex + 1) % spinnerFrames.length;
+        }, 80); // Fast smooth animation
+    }
 }
 
 /**
- * Stop the loading spinner and restore the Claude label
+ * Stop the loading spinner and restore status bar state
  * Shows warning symbol (⚠) in yellow if web scrape failed but tokens work
  * Shows error symbol (✗) in red if both web scrape AND tokens failed
+ * Error tooltips are set on ALL status bar items so user can see error from any item
  * @param {Error} [webError] - Optional web scrape error
  * @param {Error} [tokenError] - Optional token fetch error
  */
@@ -440,53 +482,70 @@ function stopSpinner(webError = null, tokenError = null) {
         clearInterval(spinnerInterval);
         spinnerInterval = null;
     }
-    if (statusBarItems.label) {
-        if (webError && tokenError) {
-            // Complete failure - both web scrape and tokens failed (RED)
-            statusBarItems.label.text = 'Claude ✗';
+    isSpinnerActive = false;
+
+    const labelText = getLabelText();
+
+    if (webError && tokenError) {
+        // Complete failure - both web scrape and tokens failed (RED)
+        const errorLines = [
+            '**Complete Fetch Failed**',
+            '',
+            `Web: ${webError.message}`,
+            `Tokens: ${tokenError.message}`,
+            '',
+            '**Debug Info**',
+            `Time: ${new Date().toLocaleString()}`,
+            '',
+            '**Actions**',
+            '• Click to retry',
+            '• Run "Claude: Show Debug Output" for details',
+            '• Run "Claude: Reset Browser Connection" to reconnect'
+        ];
+        const errorTooltip = new vscode.MarkdownString(errorLines.join('  \n'));
+
+        // Set error tooltip on ALL items
+        setAllTooltips(errorTooltip);
+
+        // Update label if visible
+        if (labelText && statusBarItems.label) {
+            statusBarItems.label.text = `${labelText} ✗`;
             statusBarItems.label.color = new vscode.ThemeColor('errorForeground');
+        }
+    } else if (webError) {
+        // Partial failure - web scrape failed but tokens may work (YELLOW)
+        const errorLines = [
+            '**Web Fetch Failed**',
+            '',
+            `Error: ${webError.message}`,
+            '',
+            '**Debug Info**',
+            `Time: ${new Date().toLocaleString()}`,
+            '',
+            'Token data may still be available',
+            '',
+            '**Actions**',
+            '• Click to retry',
+            '• Run "Claude: Show Debug Output" for details',
+            '• Run "Claude: Reset Browser Connection" to reconnect'
+        ];
+        const errorTooltip = new vscode.MarkdownString(errorLines.join('  \n'));
 
-            const errorLines = [
-                '**Complete Fetch Failed**',
-                '',
-                `Web: ${webError.message}`,
-                `Tokens: ${tokenError.message}`,
-                '',
-                '**Debug Info**',
-                `Time: ${new Date().toLocaleString()}`,
-                '',
-                '**Actions**',
-                '• Click to retry',
-                '• Run "Claude: Show Debug Output" for details',
-                '• Run "Claude: Reset Browser Connection" to reconnect'
-            ];
-            statusBarItems.label.tooltip = new vscode.MarkdownString(errorLines.join('  \n'));
-        } else if (webError) {
-            // Partial failure - web scrape failed but tokens may work (YELLOW)
-            statusBarItems.label.text = 'Claude ⚠';
+        // Set error tooltip on ALL items
+        setAllTooltips(errorTooltip);
+
+        // Update label if visible
+        if (labelText && statusBarItems.label) {
+            statusBarItems.label.text = `${labelText} ⚠`;
             statusBarItems.label.color = new vscode.ThemeColor('editorWarning.foreground');
-
-            const errorLines = [
-                '**Web Fetch Failed**',
-                '',
-                `Error: ${webError.message}`,
-                '',
-                '**Debug Info**',
-                `Time: ${new Date().toLocaleString()}`,
-                '',
-                'Token data may still be available',
-                '',
-                '**Actions**',
-                '• Click to retry',
-                '• Run "Claude: Show Debug Output" for details',
-                '• Run "Claude: Reset Browser Connection" to reconnect'
-            ];
-            statusBarItems.label.tooltip = new vscode.MarkdownString(errorLines.join('  \n'));
-        } else {
-            // Normal state - space placeholder keeps width consistent with spinner
-            statusBarItems.label.text = 'Claude  ';
+        }
+    } else {
+        // Normal state - restore label
+        if (labelText && statusBarItems.label) {
+            statusBarItems.label.text = `${labelText}  `;
             statusBarItems.label.color = undefined;
         }
+        // Tooltips will be set by updateStatusBar which is called after stopSpinner
     }
 }
 

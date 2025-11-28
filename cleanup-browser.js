@@ -5,9 +5,9 @@
 
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
+const { PATHS } = require('./src/utils');
 
-const sessionDir = path.join(os.homedir(), '.claude-browser-session');
+const sessionDir = PATHS.BROWSER_SESSION_DIR;
 
 console.log('Cleaning up browser session...');
 console.log(`Session directory: ${sessionDir}`);

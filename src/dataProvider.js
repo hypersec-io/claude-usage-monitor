@@ -3,36 +3,7 @@
 const vscode = require("vscode");
 const { ClaudeUsageScraper } = require("./scraper");
 const { UsageHistory } = require("./usageHistory");
-const { calculateResetClockTime } = require("./utils");
-
-/**
- * Get currency symbol for a currency code
- * @param {string} currency - ISO 4217 currency code (e.g., "USD", "AUD", "EUR")
- * @returns {string} Currency symbol
- */
-function getCurrencySymbol(currency) {
-  const symbols = {
-    USD: '$',
-    AUD: '$',
-    CAD: '$',
-    EUR: '€',
-    GBP: '£',
-    JPY: '¥',
-    CNY: '¥',
-    KRW: '₩',
-    INR: '₹',
-    BRL: 'R$',
-    MXN: '$',
-    CHF: 'CHF ',
-    SEK: 'kr',
-    NOK: 'kr',
-    DKK: 'kr',
-    NZD: '$',
-    SGD: '$',
-    HKD: '$',
-  };
-  return symbols[currency] || '';
-}
+const { calculateResetClockTime, getCurrencySymbol } = require("./utils");
 
 class UsageDataProvider {
   constructor() {
@@ -43,7 +14,6 @@ class UsageDataProvider {
     this.activityStats = null;
     this.scraper = new ClaudeUsageScraper();
     this.usageHistory = new UsageHistory();
-    this.isFirstFetch = true;
   }
 
   /**
@@ -255,20 +225,11 @@ class UsageDataProvider {
     let webScrapeError = null;
 
     try {
-      // Check if we have an existing session for smart headless mode
-      const hasSession = this.scraper.hasExistingSession();
+      // Always start in headless mode - ensureLoggedIn will switch to UI if needed
+      await this.scraper.initialize(false);
 
-      // Initialize scraper if needed
-      // Show browser window only if login is required
-      if (!this.scraper.isInitialized) {
-        await this.scraper.initialize(!hasSession);
-      }
-
-      // Ensure logged in (only needed first time)
-      if (this.isFirstFetch) {
-        await this.scraper.ensureLoggedIn();
-        this.isFirstFetch = false;
-      }
+      // Validate session and handle login if needed (switches to UI mode if required)
+      await this.scraper.ensureLoggedIn();
 
       // Fetch usage data from web scrape
       this.usageData = await this.scraper.fetchUsageData();
@@ -278,15 +239,22 @@ class UsageDataProvider {
         await this.usageHistory.addDataPoint(this.usageData.usagePercent);
       }
     } catch (error) {
-      // Web scrape failed, but don't fail the entire operation
-      // Session token data can still be read from local JSON
-      console.error("Web scrape failed:", error);
-      webScrapeError = error;
+      // Handle Chrome not found - create a specific error
+      if (error.message === 'CHROME_NOT_FOUND') {
+        webScrapeError = new Error('Chrome/Chromium required. Install Chrome or Chromium to fetch Claude.ai usage stats.');
+      } else {
+        // Other web scrape errors - token data can still be read from local JSON
+        console.error("Web scrape failed:", error);
+        webScrapeError = error;
+      }
 
       // Keep existing usage data if available, or set to null
       if (!this.usageData) {
         this.usageData = null;
       }
+    } finally {
+      // Always close browser after fetch to save resources
+      await this.scraper.close();
     }
 
     // Always refresh tree view (will show session data even if web scrape failed)
