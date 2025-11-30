@@ -1,3 +1,10 @@
+## [2.7.1](https://github.com/hypersec-io/claude-usage-monitor/compare/v2.7.0...v2.7.1) (2025-11-30)
+
+
+### Bug Fixes
+
+* project-specific token tracking to prevent cross-project data contamination ([40f6c52](https://github.com/hypersec-io/claude-usage-monitor/commit/40f6c527c0d0285dcc82beae1bc0f612b33c65ce))
+
 ## [2.7.1] - 2025-11-30
 
 ### Fixed
