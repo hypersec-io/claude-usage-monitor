@@ -42,3 +42,6 @@ test-*.js
 check-*.js
 examine-*.js
 RELEASE_NOTES_*.md
+
+# Archive folder for old vsix versions
+archive/
