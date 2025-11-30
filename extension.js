@@ -117,8 +117,8 @@ async function setupTokenMonitoring(context) {
         debugLog('⚠️ No workspace folder open - will use global token search');
     }
 
-    // Initialize the Claude data loader with workspace path
-    claudeDataLoader = new ClaudeDataLoader(workspacePath);
+    // Initialize the Claude data loader with workspace path and debug logger
+    claudeDataLoader = new ClaudeDataLoader(workspacePath, debugLog);
 
     // Try to find Claude data directory
     const claudeDir = await claudeDataLoader.findClaudeDataDirectory();
@@ -132,47 +132,50 @@ async function setupTokenMonitoring(context) {
 
     debugLog(`✅ Found Claude data directory: ${claudeDir}`);
 
-    // Determine which directory to watch (project-specific or global)
+    // ONLY watch project-specific directory - never fall back to global
+    // This prevents cross-project contamination when multiple VS Code windows are open
     const projectDir = await claudeDataLoader.getProjectDataDirectory();
-    const watchDir = projectDir || claudeDir;
-    const watchPattern = projectDir ? '*.jsonl' : '**/*.jsonl';
 
-    if (projectDir) {
-        debugLog(`📂 Watching project-specific directory: ${projectDir}`);
-    } else {
-        debugLog(`📂 Watching global directory: ${claudeDir}`);
+    if (!projectDir) {
+        debugLog(`⚠️ Project directory not found for workspace: ${workspacePath}`);
+        debugLog(`   Expected: ${claudeDataLoader.projectDirName}`);
+        debugLog('   Token monitoring will only work once Claude Code creates data for this project.');
+        debugLog('   Will retry on next refresh cycle.');
+        // Still do initial load attempt (will return zeros)
+        await updateTokensFromJsonl(false);
+        return;
     }
+
+    debugLog(`📂 Watching project-specific directory ONLY: ${projectDir}`);
 
     // Initial load of usage data
     await updateTokensFromJsonl(false);
 
-    // Set up file watcher for JSONL directory
+    // Set up file watcher for project-specific JSONL directory ONLY
     const fs = require('fs');
-    if (fs.existsSync(watchDir)) {
+    if (fs.existsSync(projectDir)) {
         jsonlWatcher = vscode.workspace.createFileSystemWatcher(
-            new vscode.RelativePattern(watchDir, watchPattern)
+            new vscode.RelativePattern(projectDir, '*.jsonl')
         );
 
         // Watch for file changes
-        jsonlWatcher.onDidChange(async () => {
-            debugLog('📝 JSONL file changed, updating tokens...');
+        jsonlWatcher.onDidChange(async (uri) => {
+            debugLog(`📝 JSONL file changed: ${uri.fsPath}`);
             await updateTokensFromJsonl(false);
         });
 
         // Watch for new files
-        jsonlWatcher.onDidCreate(async () => {
-            debugLog('📝 New JSONL file created, updating tokens...');
+        jsonlWatcher.onDidCreate(async (uri) => {
+            debugLog(`📝 New JSONL file created: ${uri.fsPath}`);
             await updateTokensFromJsonl(false);
         });
 
         context.subscriptions.push(jsonlWatcher);
-        debugLog('✅ File watcher active for JSONL changes');
+        debugLog('✅ File watcher active for project JSONL changes');
     }
 
-    // No polling needed - file watcher handles real-time updates
-    // and the main auto-refresh (default 5 min) handles periodic checks
     debugLog('✅ Token monitoring initialized');
-    debugLog(`   Watching: ${watchDir}/${watchPattern}`);
+    debugLog(`   Watching: ${projectDir}/*.jsonl`);
 }
 
 /**

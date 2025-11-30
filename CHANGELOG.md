@@ -1,9 +1,16 @@
-# [2.7.0](https://github.com/hypersec-io/claude-usage-monitor/compare/v2.6.6...v2.7.0) (2025-11-28)
+## [2.7.1] - 2025-11-30
 
+### Fixed
+
+- **Project-specific token tracking**: Fixed bug where token display would swap between different projects' data when multiple VS Code windows are open
+- **Exclude agent files**: Token tracking now correctly ignores agent subprocess JSONL files and only reads main session files
+- **No global fallback**: When a workspace is open, only that project's tokens are shown (no cross-project contamination)
+
+# [2.7.0](https://github.com/hypersec-io/claude-usage-monitor/compare/v2.6.6...v2.7.0) (2025-11-28)
 
 ### Features
 
-* major refactor - headless browser, dynamic ports, unified UI ([094be97](https://github.com/hypersec-io/claude-usage-monitor/commit/094be97f7b846316fba110b3e08d9988f55525f8))
+- major refactor - headless browser, dynamic ports, unified UI ([094be97](https://github.com/hypersec-io/claude-usage-monitor/commit/094be97f7b846316fba110b3e08d9988f55525f8))
 
 ## [2.6.6](https://github.com/hypersec-io/claude-usage-monitor/compare/v2.6.5...v2.6.6) (2025-11-27)
 

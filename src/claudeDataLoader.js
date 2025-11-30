@@ -8,10 +8,16 @@ const { getTokenLimit, TIMEOUTS } = require('./utils');
  * Based on approach from other Claude monitoring extensions
  */
 class ClaudeDataLoader {
-    constructor(workspacePath = null) {
+    constructor(workspacePath = null, debugLogger = null) {
         this.claudeConfigPaths = this.getClaudeConfigPaths();
         this.workspacePath = workspacePath;
         this.projectDirName = workspacePath ? this.convertPathToClaudeDir(workspacePath) : null;
+        // Use provided logger or fall back to console.log
+        this.log = debugLogger || console.log.bind(console);
+        this.log(`📂 ClaudeDataLoader initialized with workspace: ${workspacePath || '(none)'}`);
+        if (this.projectDirName) {
+            this.log(`   Looking for project dir: ${this.projectDirName}`);
+        }
     }
 
     /**
@@ -32,8 +38,8 @@ class ClaudeDataLoader {
     setWorkspacePath(workspacePath) {
         this.workspacePath = workspacePath;
         this.projectDirName = workspacePath ? this.convertPathToClaudeDir(workspacePath) : null;
-        console.log(`📂 ClaudeDataLoader workspace set to: ${workspacePath}`);
-        console.log(`   Project dir name: ${this.projectDirName}`);
+        this.log(`📂 ClaudeDataLoader workspace set to: ${workspacePath}`);
+        this.log(`   Project dir name: ${this.projectDirName}`);
     }
 
     /**
@@ -42,7 +48,7 @@ class ClaudeDataLoader {
      */
     async getProjectDataDirectory() {
         if (!this.projectDirName) {
-            console.log('⚠️ No workspace path set, falling back to global search');
+            this.log('⚠️ No workspace path set, falling back to global search');
             return null;
         }
 
@@ -55,11 +61,11 @@ class ClaudeDataLoader {
         try {
             const stat = await fs.stat(projectDir);
             if (stat.isDirectory()) {
-                console.log(`📂 Found project-specific directory: ${projectDir}`);
+                this.log(`📂 Found project-specific directory: ${projectDir}`);
                 return projectDir;
             }
         } catch (error) {
-            console.log(`⚠️ Project directory not found: ${projectDir}`);
+            this.log(`⚠️ Project directory not found: ${projectDir}`);
         }
 
         return null;
@@ -98,7 +104,7 @@ class ClaudeDataLoader {
             try {
                 const stat = await fs.stat(dirPath);
                 if (stat.isDirectory()) {
-                    console.log(`Found Claude data directory: ${dirPath}`);
+                    this.log(`Found Claude data directory: ${dirPath}`);
                     return dirPath;
                 }
             } catch (error) {
@@ -229,7 +235,7 @@ class ClaudeDataLoader {
         }
 
         const jsonlFiles = await this.findJsonlFiles(dataDir);
-        console.log(`Found ${jsonlFiles.length} JSONL files in ${dataDir}`);
+        this.log(`Found ${jsonlFiles.length} JSONL files in ${dataDir}`);
 
         const allRecords = [];
         for (const filePath of jsonlFiles) {
@@ -291,25 +297,53 @@ class ClaudeDataLoader {
      * cache_creation + cache_read from the last assistant message.
      * This represents the total prompt cache size = current session context.
      *
-     * If a workspace path is set, only looks in that project's directory.
+     * If a workspace path is set, ONLY looks in that project's directory.
+     * Does NOT fall back to global search to avoid showing wrong project's data.
      * @returns {Promise<object>} Current session usage data
      */
     async getCurrentSessionUsage() {
-        console.log('🔍 getCurrentSessionUsage() - extracting cache size from most recent message');
+        this.log('🔍 getCurrentSessionUsage() - extracting cache size from most recent message');
+        this.log(`   this.projectDirName = ${this.projectDirName}`);
+        this.log(`   this.workspacePath = ${this.workspacePath}`);
+
         // Use session duration window - session stays "active" as long as file was touched recently
         // This prevents the Tk display from flickering to "-" during pauses in conversation
         const sessionStart = Date.now() - TIMEOUTS.SESSION_DURATION;
 
-        // Try project-specific directory first, fall back to global
-        let dataDir = await this.getProjectDataDirectory();
-        const isProjectSpecific = !!dataDir;
+        // If workspace is set, ONLY use project-specific directory (no fallback)
+        // This prevents showing tokens from other projects
+        let dataDir = null;
+        let isProjectSpecific = false;
 
-        if (!dataDir) {
+        if (this.projectDirName) {
+            // Workspace is set - only look in project directory
+            dataDir = await this.getProjectDataDirectory();
+            isProjectSpecific = !!dataDir;
+            this.log(`   Project-specific dataDir = ${dataDir}`);
+
+            if (!dataDir) {
+                // Project directory doesn't exist yet - don't fall back to global
+                // This prevents showing data from other projects
+                this.log(`⚠️ Project directory not found for: ${this.projectDirName}`);
+                this.log('   Not falling back to global search to avoid cross-project data');
+                return {
+                    totalTokens: 0,
+                    inputTokens: 0,
+                    outputTokens: 0,
+                    cacheCreationTokens: 0,
+                    cacheReadTokens: 0,
+                    messageCount: 0,
+                    isActive: false
+                };
+            }
+        } else {
+            // No workspace set - use global search (single window scenario)
+            this.log('   No projectDirName set, using global search');
             dataDir = await this.findClaudeDataDirectory();
         }
 
         if (!dataDir) {
-            console.log('❌ Claude data directory not found');
+            this.log('❌ Claude data directory not found');
             return {
                 totalTokens: 0,
                 inputTokens: 0,
@@ -324,11 +358,28 @@ class ClaudeDataLoader {
         try {
             // Find JSONL files (project-specific if workspace is set)
             const allJsonlFiles = await this.findJsonlFiles(dataDir);
-            console.log(`📁 Found ${allJsonlFiles.length} JSONL files in ${isProjectSpecific ? 'project' : 'global'} directory`);
+            this.log(`📁 Found ${allJsonlFiles.length} JSONL files in ${isProjectSpecific ? 'project' : 'global'} directory`);
 
-            // Filter to files modified in last 5 minutes (active conversation)
+            // Filter to main session files only (UUID format), excluding agent-* files
+            // Agent files are subprocesses with their own smaller token contexts
+            // Main session files have the full conversation context we want to track
+            const mainSessionFiles = allJsonlFiles.filter(filePath => {
+                const filename = path.basename(filePath);
+                // Exclude agent files (agent-*.jsonl)
+                if (filename.startsWith('agent-')) {
+                    return false;
+                }
+                // Include UUID-formatted files (main sessions)
+                // UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.jsonl
+                const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.jsonl$/i;
+                return uuidPattern.test(filename);
+            });
+
+            this.log(`📁 Filtered to ${mainSessionFiles.length} main session files (excluding agent files)`);
+
+            // Filter to files modified in last hour (active conversation)
             const recentFiles = [];
-            for (const filePath of allJsonlFiles) {
+            for (const filePath of mainSessionFiles) {
                 try {
                     const stats = await fs.stat(filePath);
                     if (stats.mtimeMs >= sessionStart) {
@@ -345,10 +396,10 @@ class ClaudeDataLoader {
             // Sort by modification time (most recent first)
             recentFiles.sort((a, b) => b.modified - a.modified);
 
-            console.log(`⏱️  Found ${recentFiles.length} file(s) modified in last hour`);
+            this.log(`⏱️  Found ${recentFiles.length} main session file(s) modified in last hour`);
 
             if (recentFiles.length === 0) {
-                console.log('⚠️  No recently modified files - conversation may be inactive');
+                this.log('⚠️  No recently modified files - conversation may be inactive');
                 return {
                     totalTokens: 0,
                     inputTokens: 0,
@@ -362,11 +413,11 @@ class ClaudeDataLoader {
 
             // Read the most recently modified file
             const mostRecentFile = recentFiles[0].path;
-            console.log(`📄 Reading: ${path.basename(mostRecentFile)}`);
+            this.log(`📄 Reading: ${path.basename(mostRecentFile)}`);
 
             const content = await fs.readFile(mostRecentFile, 'utf-8');
             const lines = content.trim().split('\n');
-            console.log(`📊 File has ${lines.length} lines`);
+            this.log(`📊 File has ${lines.length} lines`);
 
             // Parse from END to START to find the last assistant message with usage data
             let sessionTokens = 0;
@@ -392,11 +443,11 @@ class ClaudeDataLoader {
                             sessionTokens = cacheRead; // Changed from: cacheCreation + cacheRead
                             messageCount = lines.length;
 
-                            console.log(`✅ Found session usage from last assistant message:`);
-                            console.log(`   Cache creation: ${cacheCreation.toLocaleString()}`);
-                            console.log(`   Cache read: ${cacheRead.toLocaleString()}`);
-                            console.log(`   Session total (using cache_read only): ${sessionTokens.toLocaleString()} tokens`);
-                            console.log(`   Percentage: ${((sessionTokens / getTokenLimit()) * 100).toFixed(2)}%`);
+                            this.log(`✅ Found session usage from last assistant message:`);
+                            this.log(`   Cache creation: ${cacheCreation.toLocaleString()}`);
+                            this.log(`   Cache read: ${cacheRead.toLocaleString()}`);
+                            this.log(`   Session total (using cache_read only): ${sessionTokens.toLocaleString()} tokens`);
+                            this.log(`   Percentage: ${((sessionTokens / getTokenLimit()) * 100).toFixed(2)}%`);
 
                             break;
                         }
