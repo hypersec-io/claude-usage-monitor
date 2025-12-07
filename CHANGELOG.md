@@ -1,3 +1,10 @@
+## [2.7.2](https://github.com/hypersec-io/claude-usage-monitor/compare/v2.7.1...v2.7.2) (2025-12-07)
+
+
+### Bug Fixes
+
+* suppress Chrome crash restore dialog blocking automation ([73cfff9](https://github.com/hypersec-io/claude-usage-monitor/commit/73cfff909d6b7b4e1becfcb03e202b228c0ddcdb))
+
 ## [2.7.2] - 2025-12-05
 
 ### Fixed
